@@ -44,6 +44,52 @@ export function isCustomChromium(): boolean {
 }
 
 /**
+ * Pick the chromium.launch() channel for a launch.
+ *
+ * Windows headless launches must use the full Chromium binary's new headless
+ * mode (channel: 'chromium') instead of the default chrome-headless-shell:
+ * the shell is a console-subsystem (WINDOWS_CUI) binary, so when the browse
+ * server runs as a detached console-less daemon, spawning it allocates a
+ * fresh VISIBLE console window that flashes and steals focus
+ * (microsoft/playwright#40741 — full chrome.exe is GUI-subsystem and never
+ * allocates one; Playwright won't fix it in processLauncher, see #39994).
+ * Setup already installs the full binary (`playwright install chromium`).
+ *
+ * Headed launches and non-Windows platforms keep Playwright's defaults.
+ */
+export function headlessLaunchChannel(
+  platform: NodeJS.Platform,
+  headless: boolean,
+): 'chromium' | undefined {
+  return platform === 'win32' && headless ? 'chromium' : undefined;
+}
+
+/**
+ * Launch with the preferred channel, degrading to Playwright's default when
+ * the channel's executable is not installed (e.g. a cache holding only
+ * chromium_headless_shell-<rev>, not the full chromium-<rev>). A console
+ * flash is annoying; a daemon that cannot launch any browser is broken.
+ */
+export async function launchWithHeadlessChannelFallback<T>(
+  launchFn: (options: any) => Promise<T>,
+  baseOptions: Record<string, unknown>,
+  channel: 'chromium' | undefined,
+): Promise<T> {
+  if (!channel) return launchFn(baseOptions);
+  try {
+    return await launchFn({ ...baseOptions, channel });
+  } catch (err: any) {
+    if (!String(err?.message ?? err).includes("Executable doesn't exist")) throw err;
+    console.warn(
+      `[browse] Full Chromium for channel '${channel}' is not installed; ` +
+        `falling back to the default headless shell (may flash a console window ` +
+        `on Windows). Install it with: bunx playwright install chromium`,
+    );
+    return launchFn(baseOptions);
+  }
+}
+
+/**
  * Decide whether Playwright should request Chromium's sandbox.
  *
  * Returns false on Windows (Bun→Node→Chromium chain breaks the sandbox,
@@ -369,17 +415,22 @@ export class BrowserManager {
       console.log(`[browse] Extensions loaded from: ${extensionsDir}`);
     }
 
-    this.browser = await chromium.launch({
-      headless: useHeadless,
-      // On Windows, Chromium's sandbox fails when the server is spawned through
-      // the Bun→Node process chain (GitHub #276). Disable it — local daemon
-      // browsing user-specified URLs has marginal sandbox benefit. Also disabled
-      // on Linux root/CI/container, where the sandbox requires unprivileged user
-      // namespaces that aren't available.
-      chromiumSandbox: shouldEnableChromiumSandbox(),
-      ...(launchArgs.length > 0 ? { args: launchArgs } : {}),
-      ...(this.proxyConfig ? { proxy: this.proxyConfig } : {}),
-    });
+    const channel = headlessLaunchChannel(process.platform, useHeadless);
+    this.browser = await launchWithHeadlessChannelFallback(
+      (options) => chromium.launch(options),
+      {
+        headless: useHeadless,
+        // On Windows, Chromium's sandbox fails when the server is spawned through
+        // the Bun→Node process chain (GitHub #276). Disable it — local daemon
+        // browsing user-specified URLs has marginal sandbox benefit. Also disabled
+        // on Linux root/CI/container, where the sandbox requires unprivileged user
+        // namespaces that aren't available.
+        chromiumSandbox: shouldEnableChromiumSandbox(),
+        ...(launchArgs.length > 0 ? { args: launchArgs } : {}),
+        ...(this.proxyConfig ? { proxy: this.proxyConfig } : {}),
+      },
+      channel,
+    );
 
     // Chromium disconnect → distinguish clean user-quit from crash. Both
     // events look identical to Playwright (one 'disconnected' fires), but
